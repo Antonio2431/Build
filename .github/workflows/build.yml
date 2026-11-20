@@ -1,0 +1,489 @@
+name: Build APK
+
+# Весь проект приложения создаётся прямо в этом файле, потом собирается в APK.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "VoiceAI"
+          include(":app")
+          EOF_FILE
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "app.voiceai"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "app.voiceai"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Голос ИИ"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/app/voiceai/MainActivity.kt)"
+          cat > app/src/main/java/app/voiceai/MainActivity.kt <<'EOF_FILE'
+          package app.voiceai
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ActivityNotFoundException
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.speech.RecognizerIntent
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class MainActivity : Activity() {
+
+              private data class AppInfo(val label: String, val pkg: String)
+
+              private lateinit var log: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+
+              private var apps: List<AppInfo> = emptyList()
+              private var history = JSONArray()
+
+              @Volatile
+              private var busy = false
+
+              private val prefs by lazy { getSharedPreferences("voiceai", Context.MODE_PRIVATE) }
+
+              private companion object {
+                  const val REQ_SPEECH = 1
+                  const val DEFAULT_MODEL = "claude-haiku-5-5"
+              }
+
+              // Как люди называют приложения голосом -> как они называются в системе
+              private val aliases = mapOf(
+                  "ютуб" to "youtube", "ютюб" to "youtube",
+                  "телеграм" to "telegram", "телеграмм" to "telegram", "телега" to "telegram",
+                  "ватсап" to "whatsapp", "вацап" to "whatsapp", "вотсап" to "whatsapp",
+                  "вайбер" to "viber", "хром" to "chrome", "гугл" to "google",
+                  "карты" to "maps", "почта" to "gmail", "инстаграм" to "instagram",
+                  "тикток" to "tiktok", "спотифай" to "spotify", "дискорд" to "discord",
+                  "настройки" to "settings", "камера" to "camera", "галерея" to "gallery",
+                  "фото" to "photos", "калькулятор" to "calculator", "часы" to "clock",
+                  "контакты" to "contacts", "телефон" to "phone", "сообщения" to "messages",
+                  "музыка" to "music", "браузер" to "browser", "клод" to "claude",
+                  "плей маркет" to "play store", "магазин" to "play store",
+                  "нетфликс" to "netflix", "фейсбук" to "facebook", "твиттер" to "x",
+                  "стим" to "steam", "майнкрафт" to "minecraft", "роблокс" to "roblox"
+              )
+
+              private val verbs = listOf(
+                  "зайди в", "зайти в", "открой", "открыть", "запусти", "запустить",
+                  "включи", "включить", "open", "launch", "start"
+              ).sortedByDescending { it.length }
+
+              private val tr = mapOf(
+                  'а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e",
+                  'ё' to "e", 'ж' to "zh", 'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k",
+                  'л' to "l", 'м' to "m", 'н' to "n", 'о' to "o", 'п' to "p", 'р' to "r",
+                  'с' to "s", 'т' to "t", 'у' to "u", 'ф' to "f", 'х' to "h", 'ц' to "c",
+                  'ч' to "ch", 'ш' to "sh", 'щ' to "sh", 'ъ' to "", 'ы' to "y", 'ь' to "",
+                  'э' to "e", 'ю' to "yu", 'я' to "ya", 'і' to "i", 'ї' to "yi", 'є' to "ye",
+                  'ґ' to "g"
+              )
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  apps = loadApps()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(16), dp(16), dp(16))
+                  }
+
+                  val top = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val title = TextView(this).apply {
+                      text = "Голос ИИ"
+                      textSize = 22f
+                  }
+                  top.addView(
+                      title,
+                      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  )
+                  val settingsBtn = Button(this).apply {
+                      text = "⚙"
+                      setOnClickListener { showSettings() }
+                  }
+                  top.addView(settingsBtn)
+                  root.addView(top)
+
+                  scroll = ScrollView(this)
+                  log = TextView(this).apply {
+                      textSize = 16f
+                      setTextIsSelectable(true)
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+                  scroll.addView(log)
+                  root.addView(
+                      scroll,
+                      LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                  )
+
+                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  input = EditText(this).apply {
+                      hint = "Команда или вопрос"
+                      setSingleLine(true)
+                      imeOptions = EditorInfo.IME_ACTION_SEND
+                      setOnEditorActionListener { _, _, _ ->
+                          sendTyped()
+                          true
+                      }
+                  }
+                  row.addView(
+                      input,
+                      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  )
+                  val sendBtn = Button(this).apply {
+                      text = "➤"
+                      setOnClickListener { sendTyped() }
+                  }
+                  row.addView(sendBtn)
+                  root.addView(row)
+
+                  val mic = Button(this).apply {
+                      text = "🎤 Говорить"
+                      textSize = 22f
+                      setOnClickListener { startVoice() }
+                  }
+                  root.addView(
+                      mic,
+                      LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(80))
+                  )
+
+                  setContentView(root)
+
+                  addMessage("", "Скажи, например: «открой ютуб». Всё остальное уйдёт ИИ (для этого нужен ключ в настройках ⚙).")
+
+                  if (savedInstanceState == null && prefs.getBoolean("autolisten", true)) {
+                      root.post { startVoice() }
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun addMessage(who: String, text: String) {
+                  runOnUiThread {
+                      log.append(if (who.isEmpty()) "$text\n\n" else "$who: $text\n\n")
+                      scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                  }
+              }
+
+              // ---------- Голос ----------
+
+              private fun startVoice() {
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(
+                          RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                          RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                      )
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                      putExtra(RecognizerIntent.EXTRA_PROMPT, "Говори")
+                  }
+                  try {
+                      startActivityForResult(i, REQ_SPEECH)
+                  } catch (e: ActivityNotFoundException) {
+                      addMessage("", "На телефоне нет службы распознавания речи (приложение Google). Пиши текстом.")
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_SPEECH && resultCode == RESULT_OK) {
+                      val text = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+                      if (!text.isNullOrBlank()) handle(text)
+                  }
+              }
+
+              private fun sendTyped() {
+                  val t = input.text.toString().trim()
+                  if (t.isNotEmpty()) {
+                      input.setText("")
+                      handle(t)
+                  }
+              }
+
+              // ---------- Обработка команды ----------
+
+              private fun handle(text: String) {
+                  addMessage("Ты", text)
+                  val q = extractAppQuery(text)
+                  if (q != null) {
+                      val app = findApp(q)
+                      if (app != null) {
+                          openApp(app)
+                          addMessage("", "Открываю ${app.label}")
+                          return
+                      }
+                  }
+                  if (apiKey().isEmpty()) {
+                      addMessage(
+                          "",
+                          if (q != null) "Не нашёл такое приложение."
+                          else "Чтобы отвечал ИИ, добавь API-ключ в настройках (⚙)."
+                      )
+                      return
+                  }
+                  askAi(text)
+              }
+
+              // ---------- Приложения ----------
+
+              private fun loadApps(): List<AppInfo> {
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  return packageManager.queryIntentActivities(i, 0)
+                      .map { AppInfo(it.loadLabel(packageManager).toString(), it.activityInfo.packageName) }
+                      .distinctBy { it.pkg }
+              }
+
+              private fun openApp(app: AppInfo) {
+                  val intent = packageManager.getLaunchIntentForPackage(app.pkg) ?: return
+                  startActivity(intent)
+              }
+
+              private fun norm(s: String): String =
+                  s.lowercase()
+                      .replace(Regex("[^\\p{L}\\p{N} ]"), " ")
+                      .replace(Regex("\\s+"), " ")
+                      .trim()
+
+              private fun translit(s: String): String = buildString {
+                  for (c in s) append(tr[c] ?: c.toString())
+              }
+
+              private fun lev(a: String, b: String): Int {
+                  val d = IntArray(b.length + 1) { it }
+                  for (i in 1..a.length) {
+                      var prev = d[0]
+                      d[0] = i
+                      for (j in 1..b.length) {
+                          val tmp = d[j]
+                          val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                          d[j] = minOf(d[j] + 1, d[j - 1] + 1, prev + cost)
+                          prev = tmp
+                      }
+                  }
+                  return d[b.length]
+              }
+
+              private fun extractAppQuery(text: String): String? {
+                  val t = norm(text)
+                  for (v in verbs) {
+                      if (t.startsWith("$v ")) return t.substring(v.length).trim()
+                  }
+                  return null
+              }
+
+              private fun findApp(query: String): AppInfo? {
+                  val q = norm(query)
+                  if (q.isEmpty()) return null
+                  val cands = mutableListOf(q)
+                  for ((k, v) in aliases) {
+                      if (q == k || q.contains(k)) cands.add(v)
+                  }
+                  var best: AppInfo? = null
+                  var bestScore = 0.0
+                  for (app in apps) {
+                      val n = norm(app.label)
+                      if (n.isEmpty()) continue
+                      var s = 0.0
+                      for (c in cands) {
+                          val score = when {
+                              n == c -> 100.0
+                              c.length >= 3 && n.contains(c) -> 80.0
+                              n.length >= 4 && c.contains(n) -> 70.0
+                              else -> {
+                                  val a = translit(c)
+                                  val b = translit(n)
+                                  (1.0 - lev(a, b).toDouble() / maxOf(a.length, b.length)) * 60.0
+                              }
+                          }
+                          if (score > s) s = score
+                      }
+                      if (s > bestScore) {
+                          bestScore = s
+                          best = app
+                      }
+                  }
+                  return if (bestScore >= 45.0) best else null
+              }
+
+              private fun openByName(name: String): String {
+                  val app = findApp(name) ?: return "Приложение «$name» не найдено."
+                  runOnUiThread { openApp(app) }
+                  return "Открыто: ${app.label}"
+              }
+
+              // ---------- ИИ (Claude API) ----------
+
+              private fun apiKey(): String = (prefs.getString("key", "") ?: "").trim()
+
+              private fun model(): String = (prefs.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL).ifEmpty { DEFAULT_MODEL }
+
+              private fun systemPrompt(): String {
+                  val names = apps.joinToString(", ") { it.label }
+                  return "Ты голосовой ассистент в Android-приложении. Отвечай по-русски, коротко и по делу, экран маленький. " +
+                      "Если человек просит открыть приложение, вызови инструмент open_app с названием из списка. " +
+                      "Сам собирать или устанавливать приложения ты не можешь, но можешь объяснять и писать код текстом. " +
+                      "Установленные приложения: " + names
+              }
+
+              private fun tools(): JSONArray = JSONArray().put(
+                  JSONObject()
+                      .put("name", "open_app")
+                      .put("description", "Открывает установленное на телефоне приложение по названию.")
+                      .put(
+                          "input_schema",
+                          JSONObject()
+                              .put("type", "object")
+                              .put(
+                                  "properties",
+                                  JSONObject().put(
+                                      "name",
+                                      JSONObject()
+                                          .put("type", "string")
+                                          .put("description", "Название приложения из списка установленных")
+                                  )
+                              )
+                              .put("required", JSONArray().put("name"))
+                      )
+              )
+
+              private fun askAi(text: String) {
+                  if (busy) {
+                      addMessage("", "Подожди, я ещё отвечаю на прошлое.")
+                      return
+                  }
+                  busy = true
+                  addMessage("", "…")
+                  Thread {
+                      try {
+                          runAgent(text)
+                      } catch (e: Exception) {
+                          history = JSONArray()
+                          addMessage("Ошибка", e.message ?: e.toString())
+                      } finally {
+                          busy = false
+                      }
+                  
